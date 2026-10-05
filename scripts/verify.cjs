@@ -183,6 +183,36 @@ async function main() {
         JSON.stringify(A));
       check('恢复期间他节点正常通信不抹除已累计次数',
         rec.atBit > off.atBit + 1408, `off=${off.atBit} rec=${rec.atBit}`);
+
+      /* 恢复资格空闲证据：按位序列出完整隐性组、打断组与来源帧、恢复边界、恢复后首发 */
+      const ev = r.recoveryEvidence?.find((e) => e.node === 'CAM-A');
+      check('响应携带 CAM-A 恢复资格空闲证据', !!ev, JSON.stringify(r.recoveryEvidence));
+      if (ev) {
+        check('证据按位序列出 128 个完整 11 位隐性组',
+          ev.recovered && ev.groups.length === 128 &&
+          ev.groups.every((g, i) => g.complete && g.length === 11 && g.n === i + 1 &&
+            g.endBit - g.startBit === 10 && g.startBit >= off.atBit &&
+            (i === 0 || g.startBit > ev.groups[i - 1].endBit)),
+          `groups=${ev.groups.length}`);
+        check('起始自 bus-off 位、第 128 组标出恢复边界且末位为恢复点',
+          ev.groups[0].startBit === off.atBit &&
+          ev.groups[127].boundary === true && ev.groups[127].endBit === rec.atBit,
+          `g0=${ev.groups[0]?.startBit} g128=${JSON.stringify(ev.groups[127])}`);
+        check('被显性位打断的未完成组单独保留打断位与来源帧',
+          ev.interrupted.length > 0 && ev.interrupted.every((it) =>
+            it.complete === false && it.length < 11 && it.length >= 1 &&
+            typeof it.interruptBit === 'number' && it.sourceFrame && it.sourceFrame.winner === 'CAM-B' &&
+            it.groupsBefore >= 1 && ev.groups.some((g) => g.n === it.n)),
+          `interrupted=${ev.interrupted.length}`);
+        check('完整组不因打断而抹除（打断前后组数连续到 128）',
+          ev.interrupted.every((it) => it.groupsBefore === ev.groups.filter((g) => g.endBit < it.interruptBit).length) &&
+          ev.sequence.filter((x) => x.kind === 'group').length === 128);
+        check('恢复边界关联恢复后首个实际发送尝试（在途帧自动重传）',
+          ev.firstSendAttempt && ev.firstSendAttempt.winner === 'CAM-A' &&
+          ev.firstSendAttempt.startBit > rec.atBit && ev.firstSendAttempt.retransmit === true &&
+          ev.groups[127].firstSendAttempt.attemptIndex === ev.firstSendAttempt.attemptIndex,
+          JSON.stringify(ev.firstSendAttempt));
+      }
     }
 
     section('阶段 4d：非法输入字段级反馈（并确认不产生结论）');

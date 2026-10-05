@@ -12,6 +12,8 @@ const state = {
     { time: 0, node: 'B', id: '0x180', dlc: 0, data: '', error: null },
   ],
   result: null,
+  recoveryNode: null, // 当前展开恢复证据的 bus-off 节点
+  recoveryEpisode: 1,
 };
 
 const MODE_TEXT = { active: '主动错误', passive: '错误被动', 'bus-off': 'bus-off' };
@@ -116,6 +118,7 @@ $('#btn-clear').addEventListener('click', () => {
   state.requests = [];
   state.result = null;
   clearFieldErrors();
+  clearRecoveryEvidence();
   $('#summary').classList.add('hidden');
   $('#attempts').innerHTML = '<p class="muted placeholder">已清空。</p>';
   renderAll();
@@ -141,6 +144,15 @@ function clearFieldErrors() {
   $$('.invalid-field').forEach((el) => el.classList.remove('invalid-field'));
   $$('.row.invalid').forEach((el) => el.classList.remove('invalid'));
   $('#field-errors').classList.add('hidden');
+}
+
+/* 恢复资格空闲证据：切换节点、重新提交或字段校验错误时必须清除旧节点证据 */
+function clearRecoveryEvidence() {
+  state.recoveryNode = null;
+  state.recoveryEpisode = 1;
+  $('#recovery-box').classList.add('hidden');
+  $('#recovery-node').innerHTML = '';
+  $('#recovery-body').innerHTML = '';
 }
 
 function showFieldErrors(errors) {
@@ -197,11 +209,12 @@ $('#btn-run').addEventListener('click', async () => {
     return;
   }
   if (!result.ok) {
-    // 校验失败：清除旧结论
+    // 校验失败：清除旧结论与旧节点恢复证据
     state.result = null;
     $('#summary').classList.add('hidden');
     $('#attempts').innerHTML = '<p class="muted placeholder">输入未通过校验，暂无结论。</p>';
     $('#stale-hint').classList.remove('hidden');
+    clearRecoveryEvidence();
     showFieldErrors(result.errors || []);
     return;
   }
@@ -253,6 +266,10 @@ function renderResult(r) {
   const box = $('#attempts');
   box.innerHTML = '';
   r.attempts.forEach((a) => box.appendChild(renderAttemptCard(a, r)));
+
+  // 恢复资格空闲证据：重新提交有效输入时先清除旧节点选择，再按新结论构建
+  clearRecoveryEvidence();
+  if (r.recoveryEvidence && r.recoveryEvidence.length) renderRecoveryBox(r);
 }
 
 function outcomeTag(status) {
@@ -380,16 +397,282 @@ function renderAttemptCard(a, r) {
 
 function bitTxt(v) { return v === 0 ? '显性(0)' : v === 1 ? '隐性(1)' : '—'; }
 
+/* --------------------- bus-off 恢复资格空闲证据 --------------------- */
+
+function renderRecoveryBox(r) {
+  const box = $('#recovery-box');
+  const sel = $('#recovery-node');
+  box.classList.remove('hidden');
+
+  // 曾进入 bus-off 的节点（按首次进入位号排序）
+  const nodes = [];
+  for (const ev of r.recoveryEvidence) {
+    if (!nodes.some((x) => x.name === ev.node)) nodes.push({ name: ev.node, firstAt: ev.busOffBit });
+  }
+  nodes.sort((a, b) => a.firstAt - b.firstAt);
+
+  // 新结论中默认选中第一个；旧选择的节点若已不存在则回到第一个（旧节点证据已随 clearRecoveryEvidence 清除）
+  if (!state.recoveryNode || !nodes.some((x) => x.name === state.recoveryNode)) {
+    state.recoveryNode = nodes[0]?.name || null;
+    state.recoveryEpisode = 1;
+  }
+
+  sel.innerHTML = '';
+  for (const n of nodes) {
+    const eps = r.recoveryEvidence.filter((ev) => ev.node === n.name);
+    const opt = document.createElement('option');
+    opt.value = n.name;
+    opt.textContent = eps.length > 1 ? `${n.name}（${eps.length} 次 bus-off）` : n.name;
+    if (n.name === state.recoveryNode) opt.selected = true;
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => {
+    // 切换节点：旧节点的恢复证据必须清除
+    state.recoveryNode = sel.value;
+    state.recoveryEpisode = 1;
+    renderRecoveryEvidence(r);
+  };
+  renderRecoveryEvidence(r);
+}
+
+function renderRecoveryEvidence(r) {
+  const body = $('#recovery-body');
+  body.innerHTML = '';
+  const name = state.recoveryNode;
+  if (!name) return;
+  const episodes = r.recoveryEvidence.filter((ev) => ev.node === name);
+  if (!episodes.length) { body.innerHTML = '<p class="muted">该节点没有 bus-off 记录。</p>'; return; }
+  if (state.recoveryEpisode > episodes.length) state.recoveryEpisode = episodes.length;
+
+  // 同一节点多次 bus-off：情节切换
+  if (episodes.length > 1) {
+    const epBar = document.createElement('div');
+    epBar.className = 'rec-epbar';
+    epBar.innerHTML = '<span class="k">bus-off 情节：</span>';
+    episodes.forEach((ev, i) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'btn small' + (i + 1 === state.recoveryEpisode ? ' primary' : '');
+      b.textContent = `第 ${i + 1} 次（位 ${ev.busOffBit}）`;
+      b.addEventListener('click', () => { state.recoveryEpisode = i + 1; renderRecoveryEvidence(r); });
+      epBar.appendChild(b);
+    });
+    body.appendChild(epBar);
+  }
+
+  const ev = episodes[state.recoveryEpisode - 1];
+  body.appendChild(renderRecoveryEvidenceCard(ev, r));
+}
+
+function frameRefText(f) {
+  if (!f) return '（空闲位，无来源帧）';
+  return `帧尝试 #${f.attemptIndex} · ${f.winner} 发 ${f.frameIdHex}${f.retransmit ? '（自动重传）' : ''} · 位 ${f.startBit}~${f.endBit - 1}`;
+}
+
+function renderRecoveryEvidenceCard(ev, r) {
+  const card = document.createElement('div');
+  card.className = 'rec-card' + (ev.recovered ? ' recovered' : ' unrecovered');
+
+  const head = document.createElement('div');
+  head.className = 'rec-status';
+  head.innerHTML = `
+    <div>节点 <b>${escapeHtml(ev.node)}</b> 于全局位 <span class="mono">${ev.busOffBit}</span> 进入 bus-off（第 ${ev.episode} 次）</div>
+    <div class="rec-verdict">${
+      ev.recovered
+        ? `🟢 已于位 <span class="mono">${ev.recoveryBit}</span> 完成 <b>第 128 个完整组</b>，恢复发送资格，TEC/REC 清零`
+        : `🔴 至回放结束（位 ${r.totalBits - 1}）仍未恢复：已累计 <b>${ev.completeGroups}</b>/128 个完整组`
+    }</div>`;
+  card.appendChild(head);
+
+  if (ev.recovered) {
+    // 恢复边界 + 恢复后首个实际发送尝试关联
+    const bd = document.createElement('div');
+    bd.className = 'rec-boundary';
+    const g128 = ev.groups.find((g) => g.boundary);
+    bd.innerHTML = `
+      <div><b>恢复边界</b>：第 128 个完整组 位 <span class="mono">${g128.startBit}~${g128.endBit}</span>（末位 ${g128.endBit} 即恢复点）</div>
+      <div class="rec-firstsend"><b>恢复后首个实际发送尝试</b>：${ev.firstSendAttempt ? frameRefText(ev.firstSendAttempt) : '回放结束前暂无发送尝试'}</div>`;
+    if (ev.firstSendAttempt) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn small btn-open-firstsend';
+      btn.textContent = '打开该帧逐位轨迹 ⤳';
+      btn.addEventListener('click', () => {
+        const a = r.attempts.find((x) => x.index === ev.firstSendAttempt.attemptIndex);
+        if (a) openTrace(a);
+      });
+      bd.querySelector('.rec-firstsend').appendChild(document.createTextNode(' '));
+      bd.querySelector('.rec-firstsend').appendChild(btn);
+      const mark = markRange(g128.startBit, g128.endBit);
+      const view = document.createElement('button');
+      view.type = 'button';
+      view.className = 'btn small';
+      view.textContent = '在全局位序中查看边界组';
+      view.addEventListener('click', () => openGlobalTrace(
+        r, g128.startBit, mark,
+        `恢复边界 · ${ev.node} 第 128 个完整隐性组（位 ${g128.startBit}~${g128.endBit}）`));
+      bd.appendChild(view);
+    }
+    card.appendChild(bd);
+  } else {
+    // 未恢复：最后一个完整组 + 当前残余隐性位数
+    const res = document.createElement('div');
+    res.className = 'rec-residual';
+    const last = ev.groups[ev.groups.length - 1];
+    res.innerHTML = `
+      <div><b>最后一个完整组</b>：${last
+        ? `第 ${last.n} 组，位 <span class="mono">${last.startBit}~${last.endBit}</span>（此前累计 ${last.groupsTotal} 组保留）`
+        : '尚无完整组'}</div>
+      <div><b>当前残余隐性位</b>：${ev.residualBits > 0
+        ? `${ev.residualBits} 位（位 <span class="mono">${ev.residualStartBit}~${ev.residualEndBit}</span>，不足 11 位，不计入组数）`
+        : '0 位（回放结束时不处于隐性连续段）'}</div>`;
+    if (ev.residualBits > 0) {
+      const view = document.createElement('button');
+      view.type = 'button';
+      view.className = 'btn small';
+      view.textContent = '在全局位序中查看残余段';
+      view.addEventListener('click', () => openGlobalTrace(
+        r, ev.residualStartBit, markRange(ev.residualStartBit, ev.residualEndBit),
+        `未恢复残余隐性段 · ${ev.node}（位 ${ev.residualStartBit}~${ev.residualEndBit}，${ev.residualBits} 位）`));
+      res.appendChild(view);
+    }
+    card.appendChild(res);
+  }
+
+  // 按位序列顺序的连续隐性组时间线（完整组 + 被打断未完成组）
+  const det = document.createElement('details');
+  det.className = 'rec-seq';
+  const nInt = ev.interrupted.length;
+  const summary = document.createElement('summary');
+  summary.innerHTML = `位序序列：${ev.groups.length} 个完整 11 位隐性组${nInt ? ` + ${nInt} 个被显性位打断的未完成组` : ''}（按全局位号顺序，点击行可定位）`;
+  det.appendChild(summary);
+
+  const table = document.createElement('table');
+  table.className = 'rec-table';
+  table.innerHTML = `<thead><tr>
+    <th>组序</th><th>11 位完整性</th><th>起始~结束全局位号</th><th>累计完整组</th><th>打断 / 来源帧</th><th></th>
+  </tr></thead><tbody></tbody>`;
+  const tb = table.querySelector('tbody');
+
+  for (const item of ev.sequence) {
+    const tr = document.createElement('tr');
+    tr.className = `seq-row ${item.kind}`;
+    if (item.kind === 'group') {
+      tr.innerHTML = `<td class="mono">#${item.n}</td>
+        <td class="ok">✓ 完整 11/11${item.boundary ? ' <span class="rec-badge">恢复边界</span>' : ''}</td>
+        <td class="mono">${item.startBit} ~ ${item.endBit}</td>
+        <td class="mono">${item.groupsTotal}</td>
+        <td>${item.boundary && ev.firstSendAttempt
+          ? `恢复后首发：${escapeHtml(frameRefText(ev.firstSendAttempt))}`
+          : (item.sourceFrames.length ? item.sourceFrames.map(frameRefText).map(escapeHtml).join('；') : '<span class="muted">总线空闲</span>')}</td>
+        <td></td>`;
+      const locate = document.createElement('button');
+      locate.type = 'button'; locate.className = 'btn small';
+      locate.textContent = '定位';
+      locate.addEventListener('click', () => openGlobalTrace(
+        r, item.startBit, markRange(item.startBit, item.endBit),
+        `${ev.node} 第 ${item.n} 个完整隐性组（位 ${item.startBit}~${item.endBit}）${item.boundary ? ' · 恢复边界' : ''}`));
+      tr.lastElementChild.appendChild(locate);
+      if (item.boundary && ev.firstSendAttempt) {
+        const fs = document.createElement('button');
+        fs.type = 'button'; fs.className = 'btn small';
+        fs.textContent = '首发帧 ⤳';
+        fs.addEventListener('click', () => {
+          const a = r.attempts.find((x) => x.index === ev.firstSendAttempt.attemptIndex);
+          if (a) openTrace(a);
+        });
+        tr.lastElementChild.appendChild(fs);
+      }
+    } else if (item.kind === 'interrupted') {
+      tr.innerHTML = `<td class="mono">#${item.n}</td>
+        <td class="bad">✗ 未完成 ${item.length}/11</td>
+        <td class="mono">${item.startBit} ~ ${item.endBit}</td>
+        <td class="mono">${item.groupsBefore} <span class="muted">（已保留）</span></td>
+        <td class="int-cell"></td>
+        <td></td>`;
+      const intCell = tr.querySelector('.int-cell');
+      intCell.innerHTML = `打断位 <span class="mono">${item.interruptBit}</span>（${item.interruptField}/${item.interruptLabel}，显性 0）<br/>
+        来源帧：${escapeHtml(frameRefText(item.sourceFrame))}`;
+      if (item.sourceFrame) {
+        const sf = document.createElement('button');
+        sf.type = 'button'; sf.className = 'btn small';
+        sf.textContent = '打开来源帧 ⤳';
+        sf.addEventListener('click', () => {
+          const a = r.attempts.find((x) => x.index === item.sourceFrame.attemptIndex);
+          if (a) openTrace(a, item.interruptBit);
+        });
+        intCell.appendChild(document.createElement('br'));
+        intCell.appendChild(sf);
+      }
+      const locate = document.createElement('button');
+      locate.type = 'button'; locate.className = 'btn small';
+      locate.textContent = '定位';
+      const marks = markRange(item.startBit, item.endBit);
+      marks.add(item.interruptBit);
+      locate.addEventListener('click', () => openGlobalTrace(
+        r, item.startBit, marks,
+        `${ev.node} 被打断未完成组（隐性位 ${item.startBit}~${item.endBit}，打断位 ${item.interruptBit}）`));
+      tr.lastElementChild.appendChild(locate);
+    } else { // residual
+      tr.innerHTML = `<td class="mono">#${item.n}</td>
+        <td class="warn">… 残余 ${item.length}/11</td>
+        <td class="mono">${item.startBit} ~ ${item.endBit}</td>
+        <td class="mono">${item.groupsBefore}</td>
+        <td><span class="muted">回放结束时仍在累计，尚未成组</span></td>
+        <td></td>`;
+      const locate = document.createElement('button');
+      locate.type = 'button'; locate.className = 'btn small';
+      locate.textContent = '定位';
+      locate.addEventListener('click', () => openGlobalTrace(
+        r, item.startBit, markRange(item.startBit, item.endBit),
+        `${ev.node} 残余隐性位（${item.startBit}~${item.endBit}）`));
+      tr.lastElementChild.appendChild(locate);
+    }
+    tb.appendChild(tr);
+  }
+  det.appendChild(table);
+  det.open = true;
+  card.appendChild(det);
+  return card;
+}
+
+function markRange(startBit, endBit) {
+  const s = new Set();
+  for (let i = startBit; i <= endBit; i++) s.add(i);
+  return s;
+}
+
 /* ------------------------- 位回放播放器 ------------------------- */
 
-const player = { trace: null, idx: 0, timer: null, attempt: null };
+const player = { trace: null, idx: 0, timer: null, attempt: null, markBits: new Set(), legendHtml: '' };
 
 function openTrace(a, gotoBit) {
   player.attempt = a;
   player.trace = a.trace;
+  player.markBits = new Set();
+  player.legendHtml = '';
   $('#trace-title').textContent = `帧尝试 #${a.index} · 获胜 ${a.winner} · ${a.frameIdHex} · 共 ${a.trace.length} 位`;
   $('#tr-slider').max = String(a.trace.length - 1);
   const start = gotoBit !== undefined ? a.trace.findIndex((b) => b.i >= gotoBit) : 0;
+  renderTrack();
+  seek(Math.max(0, start));
+  $('#trace-modal').classList.remove('hidden');
+  play();
+}
+
+// 全局位序轨迹（跨帧段/空闲段），用于展示 bus-off 恢复空闲证据所在位
+function openGlobalTrace(r, gotoBit, markBits, title) {
+  const trace = r.segments.flatMap((s) => s.bits);
+  player.attempt = null;
+  player.trace = trace;
+  player.markBits = markBits instanceof Set ? markBits : new Set(markBits || []);
+  player.legendHtml = `
+    <span><span class="sw" style="background:var(--dom)"></span>显性 0</span>
+    <span><span class="sw" style="background:var(--rec)"></span>隐性 1（空闲/帧内隐性场）</span>
+    <span><span class="sw" style="background:var(--accent2)"></span>本组隐性位 / 打断位</span>`;
+  $('#trace-title').textContent = title;
+  $('#tr-slider').max = String(Math.max(0, trace.length - 1));
+  const start = gotoBit !== undefined ? trace.findIndex((b) => b.i >= gotoBit) : 0;
   renderTrack();
   seek(Math.max(0, start));
   $('#trace-modal').classList.remove('hidden');
@@ -407,10 +690,11 @@ function renderTrack() {
   const track = $('#tr-track');
   track.innerHTML = '';
   const frag = document.createDocumentFragment();
-  const errorBits = new Set(player.attempt.errors.map((e) => e.globalBit));
+  const errorBits = new Set((player.attempt?.errors || []).map((e) => e.globalBit));
   player.trace.forEach((b, k) => {
     const cell = document.createElement('span');
-    cell.className = `bitcell ${b.bus === 0 ? 'dom' : 'rec'}${b.field === 'STUFF' ? ' stuff' : ''}${errorBits.has(b.i) ? ' errorbit' : ''}`;
+    const marked = player.markBits.has(b.i);
+    cell.className = `bitcell ${b.bus === 0 ? 'dom' : 'rec'}${b.field === 'STUFF' ? ' stuff' : ''}${errorBits.has(b.i) ? ' errorbit' : ''}${marked ? ' marked' : ''}`;
     cell.dataset.k = k;
     cell.innerHTML = `<span class="bar"></span>`;
     cell.title = `#${b.i} ${b.field}/${b.label}`;
@@ -418,7 +702,7 @@ function renderTrack() {
     frag.appendChild(cell);
   });
   track.appendChild(frag);
-  $('#tr-legend').innerHTML = `
+  $('#tr-legend').innerHTML = player.legendHtml || `
     <span><span class="sw" style="background:var(--dom)"></span>显性 0（SOF/仲裁/数据）</span>
     <span><span class="sw" style="background:var(--rec)"></span>隐性 1（线与空闲）</span>
     <span><span class="sw" style="background:var(--passive)"></span>填充位</span>

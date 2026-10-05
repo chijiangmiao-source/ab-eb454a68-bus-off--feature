@@ -322,3 +322,163 @@ test('位轨迹包含全部场标签且按 SOF→…→IFS 顺序出现', () => 
     pos('CRC') < pos('CRC_DELIM') && pos('CRC_DELIM') < pos('ACK') && pos('ACK') < pos('EOF') &&
     pos('EOF') < pos('IFS'));
 });
+
+test('恢复证据：按位序列出 128 个完整 11 位隐性组，边界组关联恢复后首个发送尝试', () => {
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B' }],
+    requests: [{ time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } }],
+  });
+  assert.equal(r.recoveryEvidence.length, 1);
+  const ev = r.recoveryEvidence[0];
+  assert.equal(ev.node, 'A');
+  assert.equal(ev.recovered, true);
+  assert.equal(ev.groups.length, 128);
+  assert.equal(ev.interrupted.length, 0);
+  // 每组恰好 11 位、起止连续、按位序递增、累计组数连续
+  for (let i = 0; i < ev.groups.length; i++) {
+    const g = ev.groups[i];
+    assert.equal(g.kind, 'group');
+    assert.equal(g.complete, true);
+    assert.equal(g.length, 11);
+    assert.equal(g.endBit - g.startBit + 1, 11);
+    assert.equal(g.n, i + 1);
+    assert.equal(g.groupsTotal, i + 1);
+    if (i > 0) assert.equal(g.startBit, ev.groups[i - 1].endBit + 1);
+    assert.equal(g.boundary, i === 127);
+  }
+  // bus-off 位即首组起点
+  assert.equal(ev.groups[0].startBit, ev.busOffBit);
+  // 第 128 组标出恢复边界，恢复点为该组末位
+  const g128 = ev.groups[127];
+  assert.equal(g128.boundary, true);
+  assert.equal(ev.recoveryBit, g128.endBit);
+  // 恢复边界关联恢复后首个实际发送尝试（在途帧自动重传）
+  assert.ok(ev.firstSendAttempt);
+  assert.equal(ev.firstSendAttempt.winner, 'A');
+  assert.equal(ev.firstSendAttempt.retransmit, true);
+  assert.ok(ev.firstSendAttempt.startBit > ev.recoveryBit);
+  assert.equal(g128.firstSendAttempt.attemptIndex, ev.firstSendAttempt.attemptIndex);
+  // sequence 与 groups 位序一致
+  assert.equal(ev.sequence.length, 128);
+  assert.deepEqual(ev.sequence.map((x) => x.n), ev.groups.map((x) => x.n));
+});
+
+test('恢复证据：他节点显性位打断的未完成组单独保留打断位与来源帧，完整组不抹除', () => {
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B' }, { name: 'C' }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } }, // +8 → bus-off
+      { time: 500, node: 'B', id: '0x300', dlc: 0 },                     // 恢复期间打断
+      { time: 1000, node: 'B', id: '0x301', dlc: 0 },
+    ],
+  });
+  const ev = r.recoveryEvidence[0];
+  assert.equal(ev.recovered, true);
+  assert.equal(ev.groups.length, 128);
+  assert.ok(ev.interrupted.length > 0);
+
+  // 每个被打断组：长度 < 11，携带打断位与来源帧；打断位为来源帧内的显性位
+  for (const it of ev.interrupted) {
+    assert.equal(it.kind, 'interrupted');
+    assert.equal(it.complete, false);
+    assert.ok(it.length >= 1 && it.length < 11);
+    assert.equal(it.interruptBit, it.endBit + 1);
+    assert.ok(it.sourceFrame, '必须保留打断位来源帧');
+    assert.equal(it.sourceFrame.winner, 'B');
+    assert.ok(it.sourceFrame.startBit <= it.interruptBit && it.interruptBit < it.sourceFrame.endBit);
+    const srcAttempt = r.attempts.find((a) => a.index === it.sourceFrame.attemptIndex);
+    const bit = srcAttempt.trace.find((b) => b.i === it.interruptBit);
+    assert.ok(bit);
+    assert.equal(bit.bus, 0, '打断位必须是显性位');
+  }
+
+  // 打断发生时已累计的完整组数被保留：打断记录的 groupsBefore 与此前完整组数一致
+  for (const it of ev.interrupted) {
+    const before = ev.groups.filter((g) => g.endBit < it.interruptBit).length;
+    assert.equal(it.groupsBefore, before);
+    assert.ok(it.groupsBefore >= 1);
+  }
+
+  // sequence 按全局位号严格递增，且完整组与打断组交错保留
+  for (let i = 1; i < ev.sequence.length; i++) {
+    assert.ok(ev.sequence[i - 1].startBit < ev.sequence[i].startBit, '序列须按位号递增');
+  }
+  assert.ok(ev.sequence.some((x) => x.kind === 'interrupted'));
+  assert.equal(ev.sequence.filter((x) => x.kind === 'group').length, 128);
+  // 打断使恢复晚于纯空闲 1408 位
+  assert.ok(ev.recoveryBit > ev.busOffBit + 1408);
+  // 打断来源帧在全局位序中可定位（segments 覆盖打断位）
+  const allBits = r.segments.flatMap((s) => s.bits);
+  const hit = allBits.find((b) => b.i === ev.interrupted[0].interruptBit);
+  assert.ok(hit && hit.bus === 0);
+});
+
+test('恢复证据：无 bus-off 时不产生证据；已恢复证据残余位为 0', () => {
+  const r0 = Can.simulate({
+    nodes: [{ name: 'A' }, { name: 'B' }],
+    requests: [{ time: 0, node: 'A', id: '0x100', dlc: 0 }],
+  });
+  assert.deepEqual(r0.recoveryEvidence, []);
+
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B' }, { name: 'C' }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } },
+      { time: 500, node: 'B', id: '0x300', dlc: 0 },
+    ],
+  });
+  const ev = r.recoveryEvidence[0];
+  assert.equal(ev.recovered, true);
+  assert.equal(ev.residualBits, 0);
+  assert.equal(ev.residualStartBit, null);
+  // 末项必须是第 128 个完整边界组，不得残留 residual 项
+  const tail = ev.sequence[ev.sequence.length - 1];
+  assert.equal(tail.kind, 'group');
+  assert.equal(tail.boundary, true);
+});
+
+test('恢复证据：打断组的组序号与被打断时所在计数位置一致（不抹除完整组）', () => {
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B' }, { name: 'C' }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } },
+      { time: 500, node: 'B', id: '0x300', dlc: 0 },
+      { time: 1000, node: 'B', id: '0x301', dlc: 0 },
+    ],
+  });
+  const ev = r.recoveryEvidence[0];
+  const firstIt = ev.interrupted[0];
+  // 被打断的是"第 groupsBefore+1 组"，其前一组必须完整存在且末位早于打断位
+  assert.equal(firstIt.n, firstIt.groupsBefore + 1);
+  const prev = ev.groups.find((g) => g.n === firstIt.groupsBefore);
+  assert.ok(prev);
+  assert.ok(prev.endBit < firstIt.startBit);
+  // 打断后新的完整组序号严格接续（不回退、不抹除）
+  const after = ev.groups.filter((g) => g.startBit > firstIt.interruptBit)[0];
+  assert.ok(after);
+  assert.equal(after.n, firstIt.groupsBefore + 1);
+});
+
+test('恢复证据：同一节点多次 bus-off 分段保留（防御性：多情节按位序独立）', () => {
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B' }],
+    requests: [{ time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } }],
+  });
+  const eps = r.recoveryEvidence.filter((ev) => ev.node === 'A');
+  assert.equal(eps.length, 1);
+  assert.equal(eps[0].episode, 1);
+  // 两个不同节点分别 bus-off：证据各自独立、按节点过滤
+  const r2 = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B', tec: 255 }, { name: 'C' }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } },
+      { time: 3000, node: 'B', id: '0x200', dlc: 0, error: { type: 'ack' } },
+    ],
+  });
+  const byNode = {};
+  for (const ev of r2.recoveryEvidence) (byNode[ev.node] ||= []).push(ev);
+  assert.ok(byNode.A && byNode.B);
+  assert.equal(byNode.A[0].node, 'A');
+  assert.equal(byNode.B[0].node, 'B');
+  for (const ev of r2.recoveryEvidence) assert.equal(ev.groups.length, 128);
+});

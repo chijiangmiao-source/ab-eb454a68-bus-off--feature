@@ -183,7 +183,8 @@
     const segments = [];
     let frameSeg = null, idleSeg = null;
     let t = 0, attemptSeq = 0;
-    const recovery = new Map();
+    const recovery = new Map();       // name -> {groups, partial, runStart, ev} 计数状态
+    const recoveryEvidence = new Map(); // name -> 历次 bus-off 恢复资格空闲证据（按进入顺序）
 
     function beginIdle() {
       if (!idleSeg) { idleSeg = { type: 'idle', startBit: t, bits: [] }; segments.push(idleSeg); }
@@ -195,21 +196,79 @@
       segments.push(frameSeg);
     }
 
+    function initRecoveryEvidence(name, atBit) {
+      const episode = (recoveryEvidence.get(name) || []).length + 1;
+      const ev = {
+        node: name,
+        episode,
+        busOffBit: atBit,
+        recovered: false,
+        recoveryBit: null,          // 第 128 个完整组末位（恢复边界）
+        completeGroups: 0,          // 已累计完整组数（恢复后为 128）
+        groups: [],                 // 按位序排列的完整 11 位隐性组
+        interrupted: [],            // 被显性位打断的未完成组
+        sequence: [],               // groups + interrupted(+residual) 合并后的位序时间线（收尾填充）
+        firstSendAttempt: null,     // 恢复后首个实际发送尝试
+        residualBits: 0,            // 未恢复：当前残余隐性位数
+        residualStartBit: null,
+        residualEndBit: null,
+      };
+      if (!recoveryEvidence.has(name)) recoveryEvidence.set(name, []);
+      recoveryEvidence.get(name).push(ev);
+      return ev;
+    }
+
     function recoveryTick(bit) {
-      for (const [name, rc] of recovery) {
-        if (bit === REC) {
+      for (const [, rc] of recovery) {
+        const ev = rc.ev;
+        if (bit.bus === REC) {
+          if (rc.partial === 0) rc.runStart = bit.i;
           rc.partial++;
           if (rc.partial === RECOVERY_GROUP_LEN) {
             rc.partial = 0;
             rc.groups++;
+            ev.groups.push({
+              kind: 'group',
+              n: rc.groups,
+              startBit: rc.runStart,
+              endBit: bit.i,
+              length: RECOVERY_GROUP_LEN,
+              complete: true,
+              groupsBefore: rc.groups - 1,
+              groupsTotal: rc.groups,
+              boundary: rc.groups === RECOVERY_GROUPS,
+              sourceFrames: [], // 收尾时按位区间解析
+            });
+            rc.runStart = null;
             if (rc.groups >= RECOVERY_GROUPS) {
-              const s = st.get(name);
+              const s = st.get(ev.node);
               s.tec = 0; s.rec = 0; s.mode = 'active'; s.busOffAt = null;
-              recovery.delete(name);
-              events.push({ type: 'recovered', node: name, atBit: t, groups: RECOVERY_GROUPS });
+              ev.recovered = true;
+              ev.recoveryBit = bit.i;
+              ev.completeGroups = rc.groups;
+              recovery.delete(ev.node);
+              events.push({ type: 'recovered', node: ev.node, atBit: bit.i, groups: RECOVERY_GROUPS, episode: ev.episode });
             }
           }
-        } else rc.partial = 0; // 显性位打断当前连续序列，已累计次数保留
+        } else if (rc.partial > 0) {
+          // 他节点显性位打断当前未完成组：单独保留打断位与来源帧，已累计完整组不抹除
+          ev.interrupted.push({
+            kind: 'interrupted',
+            n: rc.groups + 1,
+            startBit: rc.runStart,
+            endBit: bit.i - 1,
+            length: rc.partial,
+            complete: false,
+            groupsBefore: rc.groups,
+            groupsTotal: rc.groups,
+            interruptBit: bit.i,
+            interruptField: bit.field,
+            interruptLabel: bit.label,
+            sourceFrame: null, // 收尾时按打断位解析
+          });
+          rc.partial = 0;
+          rc.runStart = null;
+        }
       }
     }
 
@@ -219,7 +278,7 @@
       if (drives && Object.keys(drives).length) bit.drives = { ...drives };
       (frameSeg || (beginIdle(), idleSeg)).bits.push(bit);
       t++;
-      recoveryTick(bus);
+      recoveryTick(bit);
       return bit;
     }
 
@@ -248,8 +307,9 @@
       if (s.mode === 'bus-off') return;
       s.mode = 'bus-off';
       s.busOffAt = atBit;
-      recovery.set(name, { groups: 0, partial: 0 });
-      events.push({ type: 'bus-off', node: name, atBit, tec: s.tec });
+      const ev = initRecoveryEvidence(name, atBit);
+      recovery.set(name, { groups: 0, partial: 0, runStart: null, ev });
+      events.push({ type: 'bus-off', node: name, atBit, tec: s.tec, episode: ev.episode });
       for (const req of pending) {
         if (req.node === name && outcomes[req.index].status !== 'rejected') {
           outcomes[req.index].status = 'waiting-busoff';
@@ -727,6 +787,62 @@
     let guard = 0;
     while (recovery.size && guard++ < 4096) emit('IDLE', 'IDLE', REC, null);
 
+    /* ---- 恢复资格空闲证据收尾：解析来源帧、合并位序时间线、关联恢复后首个发送尝试 ---- */
+    const frameAt = (bitPos) => attempts.find((a) => a.startBit <= bitPos && bitPos < a.endBit) || null;
+    const frameRef = (a) => a ? {
+      attemptIndex: a.index, startBit: a.startBit, endBit: a.endBit,
+      winner: a.winner, frameIdHex: a.frameIdHex,
+      winnerRequestIndex: a.winnerRequestIndex, retransmit: a.retransmit,
+    } : null;
+
+    for (const [name, evList] of recoveryEvidence) {
+      for (const ev of evList) {
+        // 每组隐性位跨越的来源帧（通常为空；若 11 位窗口落在他节点帧的隐性场内则记录）
+        for (const g of ev.groups) {
+          g.sourceFrames = attempts
+            .filter((a) => a.startBit <= g.endBit && a.endBit > g.startBit)
+            .map(frameRef);
+        }
+        // 打断位所在的来源帧
+        for (const it of ev.interrupted) it.sourceFrame = frameRef(frameAt(it.interruptBit));
+
+        // 按位序列顺序合并完整组与被打断组
+        ev.sequence = [...ev.groups, ...ev.interrupted]
+          .sort((a, b) => a.startBit - b.startBit || a.endBit - b.endBit);
+
+        if (ev.recovered) {
+          // 恢复边界之后、下一次 bus-off 之前该节点的首个实际发送尝试（在途帧自动重传或新请求）
+          const nextOff = events.find((e) => e.type === 'bus-off' && e.node === name && e.atBit > ev.recoveryBit);
+          const first = attempts
+            .filter((a) => a.winner === name && a.startBit > ev.recoveryBit &&
+              (!nextOff || a.startBit < nextOff.atBit))
+            .sort((a, b) => a.startBit - b.startBit)[0] || null;
+          ev.firstSendAttempt = frameRef(first);
+          const boundaryGroup = ev.groups.find((g) => g.boundary) || null;
+          if (boundaryGroup) boundaryGroup.firstSendAttempt = ev.firstSendAttempt;
+        } else {
+          // 未恢复：最后一个完整组已在 groups 中；记录当前残余隐性位数
+          const rc = recovery.get(name);
+          if (rc && rc.partial > 0) {
+            ev.residualBits = rc.partial;
+            ev.residualStartBit = rc.runStart;
+            ev.residualEndBit = t - 1;
+            ev.sequence.push({
+              kind: 'residual',
+              n: rc.groups + 1,
+              startBit: rc.runStart,
+              endBit: t - 1,
+              length: rc.partial,
+              complete: false,
+              groupsBefore: rc.groups,
+              groupsTotal: rc.groups,
+            });
+          }
+          ev.completeGroups = rc ? rc.groups : ev.completeGroups;
+        }
+      }
+    }
+
     for (const o of outcomes) {
       if (o.status === 'pending-retry') { o.status = 'aborted'; o.reason = '持续错误导致节点 bus-off，发送中止'; }
     }
@@ -738,6 +854,7 @@
       attempts,
       events,
       segments,
+      recoveryEvidence: [...recoveryEvidence.values()].flat(),
       totalBits: t,
       constants: {
         recoveryGroups: RECOVERY_GROUPS,
