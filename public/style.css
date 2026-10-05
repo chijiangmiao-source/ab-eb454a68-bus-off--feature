@@ -111,6 +111,35 @@ td .tag { font-size: 10px; padding: 1px 7px; border-radius: 10px; }
 .tag.rejected, .tag.aborted { background: rgba(255,107,107,.18); color: var(--err); }
 .tag.waiting { background: rgba(240,180,41,.18); color: var(--warn); }
 
+/* bus-off 恢复资格证据 */
+.recovery-box { margin-top: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; background: var(--panel2); }
+.recovery-box h3 { font-size: 12px; margin: 0 0 8px; }
+.recovery-picker { margin-bottom: 10px; }
+.recovery-picker select { width: auto; min-width: 260px; margin-left: 6px; }
+.recovery-detail { display: flex; flex-direction: column; gap: 8px; }
+.rcv-head .rcv-title { font-size: 12px; }
+.rcv-head .rcv-sub { font-size: 11px; margin-top: 2px; }
+.rcv-timeline { display: flex; flex-direction: column; gap: 3px; max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: #0d1424; }
+.rcv-row { display: flex; flex-wrap: wrap; gap: 3px 10px; align-items: baseline; font-size: 11px; padding: 2px 4px; border-radius: 4px; }
+.rcv-row.group { background: rgba(91,123,176,.08); }
+.rcv-row.boundary { background: rgba(67,209,122,.14); outline: 1px solid rgba(67,209,122,.5); }
+.rcv-row.interrupt { background: rgba(255,107,107,.08); outline: 1px solid rgba(255,107,107,.35); }
+.rcv-seq { color: var(--muted); white-space: nowrap; min-width: 64px; }
+.rcv-row.boundary .rcv-seq { color: var(--ok); font-weight: 700; }
+.rcv-row.interrupt .rcv-seq { color: var(--err); font-weight: 700; }
+.rcv-range { flex: 1 1 220px; }
+.rcv-len.ok-text { color: var(--ok); }
+.rcv-cum { color: var(--muted); flex-basis: 100%; padding-left: 74px; }
+.rcv-flag { color: var(--ok); font-weight: 700; white-space: nowrap; }
+.rcv-src { flex-basis: 100%; padding-left: 74px; color: var(--muted); }
+.dom-text { color: var(--dom); }
+.evidence.recovery-boundary { border-color: rgba(67,209,122,.5); background: rgba(67,209,122,.07); }
+.evidence.recovery-boundary h5 { color: var(--ok); }
+.evidence.recovery-unrecovered { border-color: rgba(240,180,41,.5); background: rgba(240,180,41,.06); }
+.evidence.recovery-unrecovered h5 { color: var(--warn); }
+.rcv-fta { margin-top: 4px; }
+.rcv-fta[style] { text-decoration: underline dotted; }
+
 .attempts { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
 .attempt { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
 .attempt.err { border-left: 3px solid var(--err); }

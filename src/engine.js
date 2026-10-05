@@ -183,7 +183,8 @@
     const segments = [];
     let frameSeg = null, idleSeg = null;
     let t = 0, attemptSeq = 0;
-    const recovery = new Map();
+    const recovery = new Map();   // name -> { groups, partial, ep }
+    const episodes = [];          // 每次 bus-off 回合的恢复资格证据
 
     function beginIdle() {
       if (!idleSeg) { idleSeg = { type: 'idle', startBit: t, bits: [] }; segments.push(idleSeg); }
@@ -195,21 +196,70 @@
       segments.push(frameSeg);
     }
 
-    function recoveryTick(bit) {
+    function newEpisode(name, atBit) {
+      const ep = {
+        node: name,
+        seq: episodes.filter((e) => e.node === name).length + 1,
+        busOffAtBit: atBit,
+        groups: [],          // 已完成的 11 位连续隐性组（按完成顺序）
+        interruptions: [],   // 未完成组被显性位打断的记录
+        runStart: null,      // 当前残余隐性游程起点
+        recoveredAtBit: null,
+        recoveredGroupBoundaryBit: null, // 第 128 组末位（=recoveredAtBit）
+      };
+      episodes.push(ep);
+      return ep;
+    }
+
+    function recoveryTick(bitRec) {
       for (const [name, rc] of recovery) {
-        if (bit === REC) {
+        const ep = rc.ep;
+        if (bitRec.bus === REC) {
+          if (rc.partial === 0) ep.runStart = bitRec.i;
           rc.partial++;
           if (rc.partial === RECOVERY_GROUP_LEN) {
             rc.partial = 0;
             rc.groups++;
+            ep.groups.push({
+              seq: rc.groups,
+              startBit: ep.runStart,
+              endBit: bitRec.i,
+              length: RECOVERY_GROUP_LEN,
+              complete: true,
+              completeGroupsAfter: rc.groups,
+              recoveryBoundary: rc.groups === RECOVERY_GROUPS,
+            });
+            ep.runStart = null;
             if (rc.groups >= RECOVERY_GROUPS) {
               const s = st.get(name);
               s.tec = 0; s.rec = 0; s.mode = 'active'; s.busOffAt = null;
+              ep.recoveredGroupBoundaryBit = bitRec.i; // 第 128 组末位（恢复边界）
+              ep.boundaryGroupSeq = rc.groups;
               recovery.delete(name);
-              events.push({ type: 'recovered', node: name, atBit: t, groups: RECOVERY_GROUPS });
+              // 沿用既有约定：事件 atBit 为边界后的下一位（恢复后首个可发送位）
+              events.push({ type: 'recovered', node: name, atBit: t, groups: RECOVERY_GROUPS,
+                episodeSeq: ep.seq, boundaryBit: bitRec.i });
             }
           }
-        } else rc.partial = 0; // 显性位打断当前连续序列，已累计次数保留
+        } else if (rc.partial > 0) {
+          // 显性位打断当前未完成组：仅该游程作废，此前已累计完整组保留
+          ep.interruptions.push({
+            bit: bitRec.i,
+            field: bitRec.field,
+            label: bitRec.label,
+            partialLength: rc.partial,
+            partialStart: ep.runStart,
+            partialEnd: bitRec.i - 1,
+            groupsBefore: rc.groups,
+            sources: bitRec.drives
+              ? Object.keys(bitRec.drives).filter((n2) => bitRec.drives[n2] === DOM)
+              : [],
+            attemptIndex: frameSeg ? frameSeg.attemptIndex : null,
+            note: bitRec.note || null,
+          });
+          rc.partial = 0;
+          ep.runStart = null;
+        }
       }
     }
 
@@ -219,7 +269,7 @@
       if (drives && Object.keys(drives).length) bit.drives = { ...drives };
       (frameSeg || (beginIdle(), idleSeg)).bits.push(bit);
       t++;
-      recoveryTick(bus);
+      recoveryTick(bit);
       return bit;
     }
 
@@ -248,7 +298,8 @@
       if (s.mode === 'bus-off') return;
       s.mode = 'bus-off';
       s.busOffAt = atBit;
-      recovery.set(name, { groups: 0, partial: 0 });
+      const ep = newEpisode(name, atBit);
+      recovery.set(name, { groups: 0, partial: 0, ep });
       events.push({ type: 'bus-off', node: name, atBit, tec: s.tec });
       for (const req of pending) {
         if (req.node === name && outcomes[req.index].status !== 'rejected') {
@@ -731,6 +782,58 @@
       if (o.status === 'pending-retry') { o.status = 'aborted'; o.reason = '持续错误导致节点 bus-off，发送中止'; }
     }
 
+    /* --------------------- bus-off 恢复资格空闲证据汇总 --------------------- */
+    const recoveryEvidence = episodes.map((ep) => {
+      const live = recovery.get(ep.node);
+      const recovered = !live && ep.recoveredGroupBoundaryBit !== null;
+      const interruptions = ep.interruptions.map((it) => {
+        const src = it.attemptIndex !== null ? attempts[it.attemptIndex] : null;
+        return {
+          ...it,
+          sourceFrame: src ? {
+            attemptIndex: src.index,
+            winner: src.winner,
+            frameIdHex: src.frameIdHex,
+            requestIndex: src.winnerRequestIndex,
+          } : null,
+        };
+      });
+      const item = {
+        node: ep.node,
+        episodeSeq: ep.seq,
+        busOffAtBit: ep.busOffAtBit,
+        groups: ep.groups,                 // 按位序列顺序的完整 11 位隐性组
+        completedGroups: ep.groups.length,
+        interruptions,                     // 未完成组被显性位打断的明细（已累计组不受影响）
+        status: recovered ? 'recovered' : 'unrecovered',
+        targetGroups: RECOVERY_GROUPS,
+        groupLength: RECOVERY_GROUP_LEN,
+        replayEndBit: t,
+      };
+      if (recovered) {
+        item.recoveryBoundaryBit = ep.recoveredGroupBoundaryBit; // 第 128 组末位
+        item.recoveredAtBit = ep.recoveredGroupBoundaryBit + 1;  // 边界后首个可发送位
+        const first = attempts.find((a) =>
+          a.startBit >= item.recoveredAtBit &&
+          a.contenders.some((c) => c.node === ep.node)) || null;
+        item.firstTransmitAttempt = first ? {
+          attemptIndex: first.index,
+          startBit: first.startBit,
+          won: first.winner === ep.node,
+          winner: first.winner,
+          frameIdHex: first.frameIdHex,
+          requestIndex: first.winnerRequestIndex,
+        } : null;
+      } else {
+        // 未恢复：最后一个完整组 + 当前残余隐性位数
+        item.lastCompleteGroup = ep.groups.length ? ep.groups[ep.groups.length - 1] : null;
+        item.residualRecessiveBits = live ? live.partial : 0;
+        item.residualStartBit = live && live.partial > 0 ? ep.runStart : null;
+        item.residualEndBit = live && live.partial > 0 ? t - 1 : null;
+      }
+      return item;
+    });
+
     return {
       ok: true,
       nodes: [...st.entries()].map(([name, s]) => ({ name, tec: s.tec, rec: s.rec, mode: s.mode })),
@@ -738,6 +841,7 @@
       attempts,
       events,
       segments,
+      recoveryEvidence,
       totalBits: t,
       constants: {
         recoveryGroups: RECOVERY_GROUPS,

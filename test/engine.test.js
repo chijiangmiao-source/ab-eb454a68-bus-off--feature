@@ -307,8 +307,87 @@ test('节点上限 4、请求上限 24、时刻必须有序', () => {
   assert.ok(r2.errors.some((e) => e.field.includes('time')));
 });
 
-test('位轨迹包含全部场标签且按 SOF→…→IFS 顺序出现', () => {
+test('恢复证据：干净恢复给出 128 个完整组、起止位、累计数与恢复边界关联', () => {
   const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 248 }, { name: 'B' }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 1, data: [0], error: { type: 'bit', dataBit: 0 } },
+    ],
+  });
+  assert.ok(r.ok);
+  assert.equal(r.recoveryEvidence.length, 1);
+  const ev = r.recoveryEvidence[0];
+  assert.equal(ev.node, 'A');
+  assert.equal(ev.status, 'recovered');
+  assert.equal(ev.completedGroups, 128);
+  assert.equal(ev.interruptions.length, 0);
+  // 每组 11 位、起止位连续、按位序列顺序、累计组数单调递增
+  let expectStart = ev.groups[0].startBit;
+  ev.groups.forEach((g, i) => {
+    assert.equal(g.seq, i + 1);
+    assert.equal(g.length, 11);
+    assert.equal(g.complete, true);
+    assert.equal(g.startBit, expectStart);
+    assert.equal(g.endBit, g.startBit + 10);
+    assert.equal(g.completeGroupsAfter, i + 1);
+    expectStart = g.endBit + 1;
+  });
+  // 恢复边界：第 128 组标出，末位即边界；事件 boundaryBit 与之一致
+  assert.equal(ev.groups[127].recoveryBoundary, true);
+  assert.equal(ev.groups.slice(0, 127).some((g) => g.recoveryBoundary), false);
+  const rec = r.events.find((e) => e.type === 'recovered');
+  assert.equal(ev.recoveryBoundaryBit, rec.boundaryBit);
+  assert.equal(ev.recoveredAtBit, rec.atBit);
+  assert.equal(ev.recoveredAtBit, ev.recoveryBoundaryBit + 1);
+  // 恢复后首个实际发送尝试与边界关联
+  assert.ok(ev.firstTransmitAttempt);
+  assert.ok(ev.firstTransmitAttempt.startBit >= ev.recoveredAtBit);
+  assert.equal(ev.firstTransmitAttempt.won, true);
+  assert.equal(ev.firstTransmitAttempt.winner, 'A');
+});
+
+test('恢复证据：被他节点显性位打断时保留打断位与来源帧，且不抹除已累计完整组', () => {
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 255 }, { name: 'B' }, { name: 'C' }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 0, error: { type: 'ack' } },
+      { time: 500, node: 'B', id: '0x300', dlc: 0 },
+      { time: 1000, node: 'B', id: '0x301', dlc: 0 },
+    ],
+  });
+  const ev = r.recoveryEvidence[0];
+  assert.equal(ev.status, 'recovered');
+  assert.ok(ev.interruptions.length >= 2, '他节点帧应多次打断未完成组');
+  // 打断记录：打断位、残余游程、显性来源节点与来源帧
+  for (const it of ev.interruptions) {
+    assert.ok(it.bit > ev.busOffAtBit);
+    assert.equal(it.partialEnd, it.bit - 1);
+    assert.ok(it.partialLength >= 1 && it.partialLength < 11, '未完成组残余应为 1~10 位');
+    assert.ok(it.sources.length >= 1, '打断位必须有显性驱动来源');
+    assert.ok(it.sources.some((n) => n === 'B' || n === 'C'));
+    assert.ok(it.sourceFrame);
+    assert.equal(it.sourceFrame.winner, 'B');
+    assert.match(it.sourceFrame.frameIdHex, /^0x30[01]$/);
+    // 打断位确为来源帧中的显性位
+    const frame = frameBits(r, r.attempts.findIndex((a) => a.index === it.sourceFrame.attemptIndex));
+    const cell = frame.find((b) => b.i === it.bit);
+    assert.ok(cell);
+    assert.equal(cell.bus, 0);
+  }
+  // 已累计完整组不被抹除：组序号 1..128 完整、单调
+  assert.deepEqual(ev.groups.map((g) => g.seq), Array.from({ length: 128 }, (_, i) => i + 1));
+  // 打断时 groupsBefore 与该时刻之前已完成组数一致
+  for (const it of ev.interruptions) {
+    const done = ev.groups.filter((g) => g.endBit < it.bit).length;
+    assert.equal(it.groupsBefore, done);
+  }
+  // 打断位不属于任何完整组区间
+  for (const it of ev.interruptions) {
+    assert.ok(!ev.groups.some((g) => it.bit >= g.startBit && it.bit <= g.endBit));
+  }
+});
+
+test('位轨迹包含全部场标签且按 SOF→…→IFS 顺序出现', () => {  const r = Can.simulate({
     nodes: [{ name: 'A' }, { name: 'B' }],
     requests: [{ time: 0, node: 'A', id: '0x123', dlc: 1, data: [0xff] }],
   });

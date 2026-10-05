@@ -12,6 +12,7 @@ const state = {
     { time: 0, node: 'B', id: '0x180', dlc: 0, data: '', error: null },
   ],
   result: null,
+  recoverySelected: null, // 当前选中的恢复证据（`${node}#${episodeSeq}`）
 };
 
 const MODE_TEXT = { active: '主动错误', passive: '错误被动', 'bus-off': 'bus-off' };
@@ -115,11 +116,164 @@ $('#btn-clear').addEventListener('click', () => {
   state.nodes = [];
   state.requests = [];
   state.result = null;
+  clearRecoveryEvidence();
   clearFieldErrors();
   $('#summary').classList.add('hidden');
   $('#attempts').innerHTML = '<p class="muted placeholder">已清空。</p>';
   renderAll();
 });
+
+/* ------------------------- bus-off 恢复证据 ------------------------- */
+
+function clearRecoveryEvidence() {
+  // 切换节点、重新提交有效输入或收到字段校验错误时，旧节点的恢复证据必须清除
+  state.recoverySelected = null;
+  const box = $('#recovery-box');
+  if (box) box.classList.add('hidden');
+  const sel = $('#recovery-node');
+  if (sel) { sel.innerHTML = ''; sel.onchange = null; }
+  const detail = $('#recovery-detail');
+  if (detail) {
+    detail.innerHTML = '<span class="muted">选择节点后展开其 128×11 连续隐性位监测明细。</span>';
+  }
+}
+
+const recoveryKey = (ev) => `${ev.node}#${ev.episodeSeq}`;
+
+function renderRecoveryPicker(r) {
+  const box = $('#recovery-box');
+  const sel = $('#recovery-node');
+  const list = r.recoveryEvidence || [];
+  if (!list.length) { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+  sel.innerHTML = '';
+  const ph = document.createElement('option');
+  ph.value = ''; ph.textContent = '— 请选择节点 —';
+  sel.appendChild(ph);
+  for (const ev of list) {
+    const opt = document.createElement('option');
+    opt.value = recoveryKey(ev);
+    const round = list.filter((x) => x.node === ev.node).length > 1 ? `（第 ${ev.episodeSeq} 次 bus-off）` : '';
+    opt.textContent = `${ev.node}${round} · ${ev.status === 'recovered' ? '已恢复' : `未恢复（${ev.completedGroups}/${ev.targetGroups} 组）`}`;
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => {
+    if (!sel.value) { state.recoverySelected = null; renderRecoveryDetail(null); return; }
+    const ev = list.find((x) => recoveryKey(x) === sel.value);
+    state.recoverySelected = sel.value;
+    renderRecoveryDetail(ev, r);
+  };
+  // 重渲染后恢复先前选择（若回合仍存在），否则清空明细
+  if (state.recoverySelected && list.some((x) => recoveryKey(x) === state.recoverySelected)) {
+    sel.value = state.recoverySelected;
+    renderRecoveryDetail(list.find((x) => recoveryKey(x) === state.recoverySelected), r);
+  } else {
+    state.recoverySelected = null;
+    renderRecoveryDetail(null);
+  }
+}
+
+function renderRecoveryDetail(ev, r) {
+  const detail = $('#recovery-detail');
+  if (!ev) {
+    detail.innerHTML = '<span class="muted">选择节点后展开其 128×11 连续隐性位监测明细。</span>';
+    return;
+  }
+
+  const head = document.createElement('div');
+  head.className = 'rcv-head';
+  const statusBadge = ev.status === 'recovered'
+    ? '<span class="tag ok">已恢复发送资格</span>'
+    : '<span class="tag waiting">回放结束仍未恢复</span>';
+  head.innerHTML = `
+    <div class="rcv-title">节点 <b>${escapeHtml(ev.node)}</b> · 自全局位 <span class="mono">${ev.busOffAtBit}</span> 进入 bus-off ${statusBadge}</div>
+    <div class="rcv-sub muted">完整组 ${ev.completedGroups}/${ev.targetGroups}（每组 ${ev.groupLength} 个连续隐性位）；被打断 ${ev.interruptions.length} 次，已累计完整组不受影响。</div>`;
+  detail.innerHTML = '';
+  detail.appendChild(head);
+
+  // 合并“完整组 + 打断”为按位序列顺序的时间线
+  const timeline = [];
+  for (const g of ev.groups) timeline.push({ kind: 'group', at: g.startBit, data: g });
+  for (const it of ev.interruptions) timeline.push({ kind: 'interrupt', at: it.partialStart ?? it.bit, data: it });
+  timeline.sort((a, b) => a.at - b.at || (a.kind === 'group' ? -1 : 1));
+
+  const tl = document.createElement('div');
+  tl.className = 'rcv-timeline';
+  for (const item of timeline) {
+    if (item.kind === 'group') tl.appendChild(renderGroupRow(item.data));
+    else tl.appendChild(renderInterruptRow(item.data, r, ev));
+  }
+  detail.appendChild(tl);
+
+  if (ev.status === 'recovered') {
+    const bd = document.createElement('div');
+    bd.className = 'evidence recovery-boundary';
+    const fta = ev.firstTransmitAttempt;
+    bd.innerHTML = `
+      <h5>恢复边界 · 第 ${ev.targetGroups} 个完整组</h5>
+      <div>第 128 组末位（全局位 <span class="mono">${ev.recoveryBoundaryBit}</span>）监测完成，恢复边界成立；
+      边界后首个可发送位为 <span class="mono">${ev.recoveredAtBit}</span>，TEC/REC 清零。</div>
+      <div class="rcv-fta">恢复后首个实际发送尝试：${fta
+        ? `帧尝试 #${fta.attemptIndex}（全局位 <span class="mono">${fta.startBit}</span> 起，ID=${fta.frameIdHex}，${fta.won ? `由 ${escapeHtml(ev.node)} 获胜发送` : `仲裁由 ${escapeHtml(fta.winner)} 获胜，${escapeHtml(ev.node)} 转为接收`}）——与恢复边界 <span class="mono">${ev.recoveryBoundaryBit}</span> 关联`
+        : '<span class="muted">回放结束前该节点没有新的发送尝试（在途请求均已在此前完成）。</span>'}</div>`;
+    if (fta) {
+      const a = (r.attempts || []).find((x) => x.index === fta.attemptIndex);
+      if (a) bd.querySelector('.rcv-fta').style.cursor = 'pointer';
+      bd.querySelector('.rcv-fta').addEventListener('click', () => {
+        if (a) openTrace(a, fta.startBit);
+      });
+    }
+    detail.appendChild(bd);
+  } else {
+    const bd = document.createElement('div');
+    bd.className = 'evidence recovery-unrecovered';
+    const last = ev.lastCompleteGroup;
+    bd.innerHTML = `
+      <h5>未恢复 · 回放结束于全局位 ${ev.replayEndBit}</h5>
+      <div>最后一个完整组：${last
+        ? `第 ${last.seq} 组（全局位 <span class="mono">${last.startBit}–${last.endBit}</span>，11 位完整）`
+        : '<span class="muted">尚无完整组</span>'}</div>
+      <div>当前残余隐性位数：<b>${ev.residualRecessiveBits}</b>${ev.residualRecessiveBits
+        ? `（全局位 <span class="mono">${ev.residualStartBit}–${ev.residualEndBit}</span>，未满 ${ev.groupLength} 位，不计组）`
+        : '（无残余游程）'}</div>
+      <div class="muted">距恢复还差 ${Math.max(0, ev.targetGroups - ev.completedGroups)} 个完整组。</div>`;
+    detail.appendChild(bd);
+  }
+}
+
+function renderGroupRow(g) {
+  const row = document.createElement('div');
+  row.className = `rcv-row group${g.recoveryBoundary ? ' boundary' : ''}`;
+  row.innerHTML = `
+    <span class="rcv-seq">第 ${String(g.seq).padStart(3, '0')} 组</span>
+    <span class="rcv-range mono">全局位 ${g.startBit} – ${g.endBit}</span>
+    <span class="rcv-len ${g.complete ? 'ok-text' : ''}">${g.length} 位${g.complete ? '完整' : '不完整'}</span>
+    <span class="rcv-cum">累计 ${g.completeGroupsAfter} 组</span>
+    ${g.recoveryBoundary ? '<span class="rcv-flag">★ 恢复边界（第 128 个完整组）</span>' : ''}`;
+  return row;
+}
+
+function renderInterruptRow(it, r, ev) {
+  const row = document.createElement('div');
+  row.className = 'rcv-row interrupt';
+  const srcs = it.sources && it.sources.length ? it.sources.map(escapeHtml).join('、') : '（未知节点）';
+  const frame = it.sourceFrame
+    ? `来源帧：帧尝试 #${it.sourceFrame.attemptIndex}，${escapeHtml(it.sourceFrame.winner)} 发送 ID=${it.sourceFrame.frameIdHex}`
+    : '打断位不在任何帧段内';
+  row.innerHTML = `
+    <span class="rcv-seq">打断</span>
+    <span class="rcv-range mono">未完成组残余 ${it.partialLength} 位（全局位 ${it.partialStart}–${it.partialEnd}）→ 打断位 <b class="dom-text">${it.bit}</b>（${it.field}/${it.label}，显性驱动：${srcs}）</span>
+    <span class="rcv-src">${frame}；打断前已累计的 ${it.groupsBefore || 0} 个完整组保留</span>`;
+  if (it.sourceFrame) {
+    const a = (r.attempts || []).find((x) => x.index === it.sourceFrame.attemptIndex);
+    if (a) {
+      row.style.cursor = 'pointer';
+      row.title = '点击打开来源帧位轨迹并定位到打断位';
+      row.addEventListener('click', () => openTrace(a, it.bit));
+    }
+  }
+  return row;
+}
 
 /* ------------------------- 组装与提交 ------------------------- */
 
@@ -197,8 +351,9 @@ $('#btn-run').addEventListener('click', async () => {
     return;
   }
   if (!result.ok) {
-    // 校验失败：清除旧结论
+    // 校验失败：清除旧结论（含旧节点的恢复证据）
     state.result = null;
+    clearRecoveryEvidence();
     $('#summary').classList.add('hidden');
     $('#attempts').innerHTML = '<p class="muted placeholder">输入未通过校验，暂无结论。</p>';
     $('#stale-hint').classList.remove('hidden');
@@ -207,6 +362,8 @@ $('#btn-run').addEventListener('click', async () => {
   }
   $('#stale-hint').classList.add('hidden');
   state.result = result;
+  // 重新提交有效输入：旧节点的恢复证据清除，由新结果重建
+  state.recoverySelected = null;
   renderResult(result);
 });
 
@@ -248,6 +405,9 @@ function renderResult(r) {
     tb.appendChild(tr);
   });
   $('#summary').classList.remove('hidden');
+
+  // bus-off 恢复资格证据（无 bus-off 回合时整块隐藏）
+  renderRecoveryPicker(r);
 
   // 逐帧卡片
   const box = $('#attempts');
